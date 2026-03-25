@@ -22,7 +22,14 @@ type Codec interface {
 	Decode(r io.Reader) (FrameHeader, []byte, error)
 }
 
-var crcTable = crc32.MakeTable(crc32.Castagnoli)
+var (
+	crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+	ErrInvalidFrameMagic    = errors.New("wal: invalid frame magic")
+	ErrInvalidFrameVersion  = errors.New("wal: invalid frame version")
+	ErrUnsupportedFrameType = errors.New("wal: unsupported frame type")
+	ErrInvalidFrameChecksum = errors.New("wal: invalid frame checksum")
+)
 
 // BinaryCodec encodes the v1 full-frame WAL format.
 type BinaryCodec struct{}
@@ -75,13 +82,13 @@ func (BinaryCodec) Decode(r io.Reader) (FrameHeader, []byte, error) {
 	}
 
 	if header.Magic != Magic {
-		return FrameHeader{}, nil, errors.New("wal: invalid frame magic")
+		return FrameHeader{}, nil, ErrInvalidFrameMagic
 	}
 	if header.Version != FormatVersion {
-		return FrameHeader{}, nil, errors.New("wal: invalid frame version")
+		return FrameHeader{}, nil, ErrInvalidFrameVersion
 	}
 	if !header.Type.Valid() {
-		return FrameHeader{}, nil, errors.New("wal: unsupported frame type")
+		return FrameHeader{}, nil, ErrUnsupportedFrameType
 	}
 
 	payload := make([]byte, header.Length)
@@ -89,7 +96,7 @@ func (BinaryCodec) Decode(r io.Reader) (FrameHeader, []byte, error) {
 		return FrameHeader{}, nil, err
 	}
 	if checksumFrame(header.Type, payload) != header.Checksum {
-		return FrameHeader{}, nil, errors.New("wal: invalid frame checksum")
+		return FrameHeader{}, nil, ErrInvalidFrameChecksum
 	}
 
 	return header, payload, nil
