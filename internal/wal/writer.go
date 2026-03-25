@@ -30,7 +30,7 @@ type FileWriter struct {
 	syncer   Syncer
 }
 
-// NewFileWriter creates a phase 1 writer.
+// Append writes one logical record as one or more physical frames into the active segment.
 func NewFileWriter(segments *FileSegmentManager, codec Codec, syncer Syncer) *FileWriter {
 	return &FileWriter{
 		segments: segments,
@@ -39,7 +39,7 @@ func NewFileWriter(segments *FileSegmentManager, codec Codec, syncer Syncer) *Fi
 	}
 }
 
-// Append writes one full physical frame into the active segment.
+// Append writes one logical record as one or more physical frames into the active segment.
 func (w *FileWriter) Append(ctx context.Context, req AppendRequest) (AppendResult, error) {
 	select {
 	case <-ctx.Done():

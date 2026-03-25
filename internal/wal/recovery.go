@@ -12,12 +12,6 @@ var ErrCorruption = errors.New("wal: corruption detected")
 
 var errTailCorruption = errors.New("wal: tail corruption")
 
-// RecoveryPlan describes the work required to make the WAL readable.
-type RecoveryPlan struct {
-	TruncateSegment uint64
-	TruncateOffset  uint64
-}
-
 // RecoveryResult describes the WAL state after startup recovery.
 type RecoveryResult struct {
 	LastSegment uint64
@@ -26,11 +20,10 @@ type RecoveryResult struct {
 
 // RecoveryManager validates and repairs the WAL tail on open.
 type RecoveryManager interface {
-	Plan() (RecoveryPlan, error)
 	Recover() (RecoveryResult, error)
 }
 
-// Recover scans existing segments and truncates an incomplete or corrupted tail record.
+// Recover scans existing segments, truncates incomplete tail data, and fails on mid-log corruption.
 func Recover(dir string, _ Codec) (RecoveryResult, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return RecoveryResult{}, err
@@ -138,12 +131,15 @@ func scanSegment(path string, size uint64) (uint64, error) {
 		
 		payload := make([]byte, header.Length)
 		if _, err := file.ReadAt(payload, int64(offset+uint64(HeaderSize))); err != nil {
-			if inChunks {
-				return recordStart, errTailCorruption
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				if inChunks {
+					return recordStart, errTailCorruption
+				}
+				return offset, errTailCorruption
 			}
-			return offset, errTailCorruption
+			return 0, err
 		}
-		
+
 		if checksumFrame(header.Type, payload) != header.Checksum {
 			if frameEnd < size {
 				if inChunks {
@@ -179,9 +175,9 @@ func scanSegment(path string, size uint64) (uint64, error) {
 			inChunks = false
 		default:
 			if inChunks {
-				return recordStart, errTailCorruption
+				return recordStart, ErrCorruption
 			}
-			return offset, errTailCorruption
+			return offset, ErrCorruption
 		}
 
 		offset = frameEnd

@@ -38,6 +38,81 @@ func TestConfigValidateInvalid(t *testing.T) {
 	}
 }
 
+func TestConfigValidateBoundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "zero segment size",
+			cfg: Config{
+				Dir:            t.TempDir(),
+				ChunkSizeBytes: 64,
+				MaxRecordSize:  128,
+				SyncPolicy:     SyncNone,
+			},
+		},
+		{
+			name: "zero chunk size",
+			cfg: Config{
+				Dir:              t.TempDir(),
+				SegmentSizeBytes: 1024,
+				MaxRecordSize:    128,
+				SyncPolicy:       SyncNone,
+			},
+		},
+		{
+			name: "zero max record size",
+			cfg: Config{
+				Dir:              t.TempDir(),
+				SegmentSizeBytes: 1024,
+				ChunkSizeBytes:   64,
+				SyncPolicy:       SyncNone,
+			},
+		},
+		{
+			name: "invalid sync policy",
+			cfg: Config{
+				Dir:              t.TempDir(),
+				SegmentSizeBytes: 1024,
+				ChunkSizeBytes:   64,
+				MaxRecordSize:    128,
+				SyncPolicy:       SyncPolicy(99),
+			},
+		},
+		{
+			name: "negative sync interval in batch mode",
+			cfg: Config{
+				Dir:              t.TempDir(),
+				SegmentSizeBytes: 1024,
+				ChunkSizeBytes:   64,
+				MaxRecordSize:    128,
+				SyncPolicy:       SyncBatch,
+				SyncInterval:     -time.Second,
+			},
+		},
+		{
+			name: "max record plus overhead exceeds segment",
+			cfg: Config{
+				Dir:              t.TempDir(),
+				SegmentSizeBytes: 40,
+				ChunkSizeBytes:   4,
+				MaxRecordSize:    32,
+				SyncPolicy:       SyncNone,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidConfig", err)
+			}
+		})
+	}
+}
+
 func TestAppendOneRecordAndReplay(t *testing.T) {
 	log := openTestWAL(t)
 
@@ -53,9 +128,7 @@ func TestAppendOneRecordAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	record, err := r.Next(context.Background())
 	if err != nil {
@@ -98,9 +171,7 @@ func TestAppendMultipleRecordsAndReplayInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	for i, item := range want {
 		record, err := r.Next(context.Background())
@@ -133,9 +204,7 @@ func TestAppendEmptyPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	record, err := r.Next(context.Background())
 	if err != nil {
@@ -146,6 +215,85 @@ func TestAppendEmptyPayload(t *testing.T) {
 	}
 	if len(record.Data) != 0 {
 		t.Fatalf("Next() data length = %d, want 0", len(record.Data))
+	}
+}
+
+func TestAppendRejectsRecordTooLarge(t *testing.T) {
+	log := openConcreteTestWAL(t, Config{
+		Dir:              t.TempDir(),
+		SegmentSizeBytes: 1024,
+		ChunkSizeBytes:   64,
+		MaxRecordSize:    8,
+		SyncPolicy:       SyncNone,
+	})
+
+	_, err := log.Append(context.Background(), []byte("this payload is too large"))
+	if !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("Append() error = %v, want ErrRecordTooLarge", err)
+	}
+}
+
+func TestReaderUsesSnapshot(t *testing.T) {
+	log := openTestWAL(t)
+
+	if _, err := log.Append(context.Background(), []byte("alpha")); err != nil {
+		t.Fatalf("Append(alpha) error = %v", err)
+	}
+
+	r, err := log.NewReader(ZeroPosition())
+	if err != nil {
+		t.Fatalf("NewReader() error = %v", err)
+	}
+	defer r.Close()
+
+	if _, err := log.Append(context.Background(), []byte("beta")); err != nil {
+		t.Fatalf("Append(beta) error = %v", err)
+	}
+
+	record, err := r.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+	if string(record.Data) != "alpha" {
+		t.Fatalf("Next() data = %q, want %q", string(record.Data), "alpha")
+	}
+
+	_, err = r.Next(context.Background())
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Next() final error = %v, want io.EOF", err)
+	}
+}
+
+func TestReaderCloseIsIdempotent(t *testing.T) {
+	log := openTestWAL(t)
+
+	r, err := log.NewReader(ZeroPosition())
+	if err != nil {
+		t.Fatalf("NewReader() error = %v", err)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+func TestReaderNextAfterCloseReturnsErrClosed(t *testing.T) {
+	log := openTestWAL(t)
+
+	r, err := log.NewReader(ZeroPosition())
+	if err != nil {
+		t.Fatalf("NewReader() error = %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	_, err = r.Next(context.Background())
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Next() error = %v, want ErrClosed", err)
 	}
 }
 
@@ -176,9 +324,7 @@ func TestRolloverAndReplayAcrossSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	for i, item := range want {
 		record, err := r.Next(context.Background())
@@ -191,6 +337,11 @@ func TestRolloverAndReplayAcrossSegments(t *testing.T) {
 		if string(record.Data) != item {
 			t.Fatalf("Next() #%d data = %q, want %q", i, string(record.Data), item)
 		}
+	}
+
+	_, err = r.Next(context.Background())
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Next() final error = %v, want io.EOF", err)
 	}
 }
 
@@ -211,9 +362,7 @@ func TestReplayFromPositionAcrossSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	for i, item := range want[1:] {
 		record, err := r.Next(context.Background())
@@ -268,7 +417,7 @@ func TestNewReaderRejectsInvalidPositions(t *testing.T) {
 			name: "segment end",
 			pos: Position{
 				Segment: second.Segment,
-				Offset:  second.Offset + 16 + uint64(len("beta")),
+				Offset:  second.Offset + uint64(internalwal.HeaderSize) + uint64(len("beta")),
 			},
 		},
 	}
@@ -280,6 +429,42 @@ func TestNewReaderRejectsInvalidPositions(t *testing.T) {
 				t.Fatalf("NewReader(%+v) error = %v, want ErrInvalidPosition", tc.pos, err)
 			}
 		})
+	}
+}
+
+func TestNewReaderAfterWALCloseReturnsErrClosed(t *testing.T) {
+	log := openConcreteTestWALNoCleanup(t, Config{
+		Dir:              t.TempDir(),
+		SegmentSizeBytes: 1024,
+		ChunkSizeBytes:   64,
+		MaxRecordSize:    512,
+		SyncPolicy:       SyncNone,
+	})
+
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	_, err := log.NewReader(ZeroPosition())
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("NewReader() error = %v, want ErrClosed", err)
+	}
+}
+
+func TestWALCloseIsIdempotent(t *testing.T) {
+	log := openConcreteTestWALNoCleanup(t, Config{
+		Dir:              t.TempDir(),
+		SegmentSizeBytes: 1024,
+		ChunkSizeBytes:   64,
+		MaxRecordSize:    512,
+		SyncPolicy:       SyncNone,
+	})
+
+	if err := log.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
 	}
 }
 
@@ -324,6 +509,27 @@ func TestSyncBatchFlushesOnThreshold(t *testing.T) {
 	waitForSyncCount(t, log.syncer, 1)
 	if got := log.syncer.PendingBytes(); got != 0 {
 		t.Fatalf("PendingBytes() = %d, want 0 after threshold flush", got)
+	}
+}
+
+func TestSyncBatchFlushesOnInterval(t *testing.T) {
+	log := openConcreteTestWAL(t, Config{
+		Dir:              t.TempDir(),
+		SegmentSizeBytes: 1024,
+		ChunkSizeBytes:   64,
+		MaxRecordSize:    512,
+		SyncPolicy:       SyncBatch,
+		SyncInterval:     20 * time.Millisecond,
+		BytesPerSync:     0,
+	})
+
+	if _, err := log.Append(context.Background(), []byte("alpha")); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	waitForSyncCount(t, log.syncer, 1)
+	if got := log.syncer.PendingBytes(); got != 0 {
+		t.Fatalf("PendingBytes() = %d, want 0 after interval flush", got)
 	}
 }
 
@@ -380,6 +586,61 @@ func TestCloseFlushesPendingBatchWrites(t *testing.T) {
 	}
 	if _, err := log.Append(context.Background(), []byte("beta")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Append() after Close error = %v, want ErrClosed", err)
+	}
+}
+
+func TestConcurrentAppendAndReplayCount(t *testing.T) {
+	log := openConcreteTestWAL(t, Config{
+		Dir:              t.TempDir(),
+		SegmentSizeBytes: 64 * 1024,
+		ChunkSizeBytes:   256,
+		MaxRecordSize:    1024,
+		SyncPolicy:       SyncNone,
+	})
+
+	const goroutines = 20
+	const perG = 50
+
+	errCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			for i := 0; i < perG; i++ {
+				if _, err := log.Append(context.Background(), []byte("msg")); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+	}
+
+	for i := 0; i < goroutines; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("Append() error = %v", err)
+		}
+	}
+
+	r, err := log.NewReader(ZeroPosition())
+	if err != nil {
+		t.Fatalf("NewReader() error = %v", err)
+	}
+	defer r.Close()
+
+	count := 0
+	for {
+		_, err := r.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next() error = %v", err)
+		}
+		count++
+	}
+
+	want := goroutines * perG
+	if count != want {
+		t.Fatalf("replayed count = %d, want %d", count, want)
 	}
 }
 
@@ -667,9 +928,7 @@ func assertReplayData(t *testing.T, wal WAL, from Position, want []string) {
 	if err != nil {
 		t.Fatalf("NewReader() error = %v", err)
 	}
-	t.Cleanup(func() {
-		_ = r.Close()
-	})
+	defer r.Close()
 
 	for i, item := range want {
 		record, err := r.Next(context.Background())
