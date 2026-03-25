@@ -50,7 +50,7 @@ type WAL interface {
 	Close() error
 }
 
-// Open validates configuration and opens the phase 1 WAL.
+// Open validates configuration and opens the WAL.
 func Open(cfg Config) (WAL, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (cfg Config) Validate() error {
 	case cfg.MaxRecordSize == 0:
 		return wrapInvalidConfig("max record size must be greater than zero")
 	case physicalSizeForRecord(cfg.MaxRecordSize, cfg.ChunkSizeBytes) > cfg.SegmentSizeBytes:
-		return wrapInvalidConfig("max record size must not exceed segment size")
+		return wrapInvalidConfig("max record size plus frame overhead must fit within one segment")
 	}
 
 	switch cfg.SyncPolicy {
@@ -218,10 +218,6 @@ func (l *log) Close() error {
 	}
 
 	return errors.Join(errs...)
-}
-
-func (p Position) isZero() bool {
-	return p == ZeroPosition()
 }
 
 func wrapInvalidConfig(msg string) error {
