@@ -150,7 +150,7 @@ Segment size behavior:
 - A single logical record larger than remaining space rolls over before its first chunk
 - A logical record may span multiple chunks, but in v1 it must not span segments
 
-That v1 constraint keeps recovery and replay simpler and is appropriate for the initial production version. It implies `MaxRecordSize` must be less than or equal to the usable capacity of one segment.
+That v1 constraint keeps recovery and replay simpler and is appropriate for the initial production version. It implies `MaxRecordSize`, together with the required physical frame overhead for its chunk layout, must fit within one segment.
 
 ## Sync Policy
 
@@ -242,7 +242,7 @@ Initial production-oriented constraint:
 
 - Chunking exists to bound in-memory write buffers and frame size
 - In v1, a logical record must remain within one segment
-- `MaxRecordSize` and `ChunkSizeBytes` must be validated against segment capacity
+- `MaxRecordSize` and `ChunkSizeBytes` must be validated against segment capacity including chunk-frame overhead
 
 ## Public Interfaces
 
