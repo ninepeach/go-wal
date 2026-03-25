@@ -30,6 +30,11 @@ func NewFileSyncer(file *os.File, policy int) *FileSyncer {
 	}
 }
 
+// SetFile updates the active segment file used for sync.
+func (s *FileSyncer) SetFile(file *os.File) {
+	s.file = file
+}
+
 // Request performs a synchronous flush only when configured to do so.
 func (s *FileSyncer) Request(ctx context.Context, _ SyncRequest) error {
 	select {

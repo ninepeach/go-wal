@@ -3,6 +3,7 @@ package wal
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"time"
 
@@ -55,7 +56,7 @@ func Open(cfg Config) (WAL, error) {
 		return nil, err
 	}
 
-	segments, err := internalwal.OpenSingleSegment(cfg.Dir)
+	segments, err := internalwal.OpenSegments(cfg.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +88,7 @@ func (cfg Config) Validate() error {
 		return wrapInvalidConfig("chunk size must be greater than zero")
 	case cfg.MaxRecordSize == 0:
 		return wrapInvalidConfig("max record size must be greater than zero")
-	case cfg.MaxRecordSize > cfg.SegmentSizeBytes:
+	case cfg.MaxRecordSize+uint64(internalwal.HeaderSize) > cfg.SegmentSizeBytes:
 		return wrapInvalidConfig("max record size must not exceed segment size")
 	}
 
@@ -125,8 +126,14 @@ func (l *log) Append(ctx context.Context, data []byte) (Position, error) {
 	}
 
 	frameSize := uint64(internalwal.HeaderSize) + uint64(len(data))
-	if l.segments.Size()+frameSize > l.cfg.SegmentSizeBytes {
+	if frameSize > l.cfg.SegmentSizeBytes {
 		return ZeroPosition(), ErrRecordTooLarge
+	}
+	if l.segments.Size()+frameSize > l.cfg.SegmentSizeBytes {
+		if _, err := l.segments.Rollover(); err != nil {
+			return ZeroPosition(), err
+		}
+		l.syncer.SetFile(l.segments.WriterFile())
 	}
 
 	res, err := l.writer.Append(ctx, internalwal.AppendRequest{Data: data})
@@ -147,22 +154,27 @@ func (l *log) NewReader(from Position) (Reader, error) {
 	if l.closed {
 		return nil, ErrClosed
 	}
-	if !from.isZero() {
-		return nil, ErrInvalidPosition
-	}
-
-	file, err := l.segments.ReaderFile()
+	refs, err := snapshotReplaySegments(l.segments.Snapshot())
 	if err != nil {
 		return nil, err
 	}
 
+	inner, err := internalwal.NewFileReader(refs, internalwal.ReplayRequest{
+		Segment: from.Segment,
+		Offset:  from.Offset,
+	}, internalwal.BinaryCodec{})
+	if err != nil {
+		if errors.Is(err, internalwal.ErrReplayPositionNotFound) {
+			return nil, ErrInvalidPosition
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrInvalidPosition
+		}
+		return nil, err
+	}
+
 	return &reader{
-		inner: internalwal.NewFileReader(
-			file,
-			l.segments.Active().ID,
-			l.segments.Size(),
-			internalwal.BinaryCodec{},
-		),
+		inner: inner,
 	}, nil
 }
 
@@ -197,4 +209,20 @@ func (p Position) isZero() bool {
 
 func wrapInvalidConfig(msg string) error {
 	return errors.Join(ErrInvalidConfig, errors.New(msg))
+}
+
+func snapshotReplaySegments(refs []internalwal.SegmentRef) ([]internalwal.ReplaySegment, error) {
+	out := make([]internalwal.ReplaySegment, 0, len(refs))
+	for _, ref := range refs {
+		info, err := os.Stat(ref.Path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, internalwal.ReplaySegment{
+			ID:   ref.ID,
+			Path: ref.Path,
+			Size: uint64(info.Size()),
+		})
+	}
+	return out, nil
 }
