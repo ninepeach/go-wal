@@ -78,7 +78,7 @@ func (BinaryCodec) Decode(r io.Reader) (FrameHeader, []byte, error) {
 	if header.Version != FormatVersion {
 		return FrameHeader{}, nil, errors.New("wal: invalid frame version")
 	}
-	if header.Type != FrameTypeFull {
+	if !header.Type.Valid() {
 		return FrameHeader{}, nil, errors.New("wal: unsupported frame type")
 	}
 

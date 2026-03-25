@@ -7,7 +7,8 @@ import (
 
 // AppendRequest describes one logical append request.
 type AppendRequest struct {
-	Data []byte
+	Data      []byte
+	ChunkSize uint32
 }
 
 // AppendResult describes the result of one append request.
@@ -47,21 +48,21 @@ func (w *FileWriter) Append(ctx context.Context, req AppendRequest) (AppendResul
 	}
 
 	offset := w.segments.Size()
-	header := FrameHeader{
-		Type: FrameTypeFull,
-	}
-
-	var buf bytes.Buffer
-	if err := w.codec.Encode(&buf, header, req.Data); err != nil {
+	frames, err := buildFrames(w.codec, req.Data, req.ChunkSize)
+	if err != nil {
 		return AppendResult{}, err
 	}
 
-	if _, err := w.segments.WriterFile().Write(buf.Bytes()); err != nil {
-		return AppendResult{}, err
+	var totalBytes uint64
+	for _, frame := range frames {
+		if _, err := w.segments.WriterFile().Write(frame); err != nil {
+			return AppendResult{}, err
+		}
+		totalBytes += uint64(len(frame))
 	}
-	w.segments.Advance(uint64(buf.Len()))
+	w.segments.Advance(totalBytes)
 
-	if err := w.syncer.Request(ctx, SyncRequest{Bytes: uint64(buf.Len())}); err != nil {
+	if err := w.syncer.Request(ctx, SyncRequest{Bytes: totalBytes}); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -77,4 +78,63 @@ func (w *FileWriter) Close() error {
 		return nil
 	}
 	return w.syncer.Close()
+}
+
+func buildFrames(codec Codec, data []byte, chunkSize uint32) ([][]byte, error) {
+	if len(data) == 0 || uint32(len(data)) <= chunkSize {
+		frame, err := encodeFrame(codec, FrameTypeFull, data)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{frame}, nil
+	}
+
+	frames := make([][]byte, 0, chunkCount(len(data), chunkSize))
+	for start := 0; start < len(data); start += int(chunkSize) {
+		end := start + int(chunkSize)
+		if end > len(data) {
+			end = len(data)
+		}
+
+		frameType := FrameTypeMiddle
+		switch {
+		case start == 0:
+			frameType = FrameTypeFirst
+		case end == len(data):
+			frameType = FrameTypeLast
+		}
+
+		frame, err := encodeFrame(codec, frameType, data[start:end])
+		if err != nil {
+			return nil, err
+		}
+		frames = append(frames, frame)
+	}
+
+	return frames, nil
+}
+
+func encodeFrame(codec Codec, frameType FrameType, payload []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := codec.Encode(&buf, FrameHeader{Type: frameType}, payload); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func chunkCount(length int, chunkSize uint32) int {
+	if length == 0 {
+		return 1
+	}
+	if uint32(length) <= chunkSize {
+		return 1
+	}
+	size := int(chunkSize)
+	return (length + size - 1) / size
+}
+
+// BuildTestFrames constructs the physical frames for one logical record.
+// It is intended for package tests that need crash-style file mutation.
+func BuildTestFrames(data []byte, chunkSize uint32) ([][]byte, error) {
+	return buildFrames(BinaryCodec{}, data, chunkSize)
 }

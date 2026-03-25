@@ -55,13 +55,24 @@ func Open(cfg Config) (WAL, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if _, err := internalwal.Recover(cfg.Dir, internalwal.BinaryCodec{}); err != nil {
+		if errors.Is(err, internalwal.ErrCorruption) {
+			return nil, ErrCorruption
+		}
+		return nil, err
+	}
 
 	segments, err := internalwal.OpenSegments(cfg.Dir)
 	if err != nil {
 		return nil, err
 	}
 
-	syncer := internalwal.NewFileSyncer(segments.WriterFile(), int(cfg.SyncPolicy))
+	syncer := internalwal.NewFileSyncer(
+		segments.WriterFile(),
+		int(cfg.SyncPolicy),
+		cfg.SyncInterval,
+		cfg.BytesPerSync,
+	)
 	writer := internalwal.NewFileWriter(segments, internalwal.BinaryCodec{}, syncer)
 
 	return &log{
@@ -88,7 +99,7 @@ func (cfg Config) Validate() error {
 		return wrapInvalidConfig("chunk size must be greater than zero")
 	case cfg.MaxRecordSize == 0:
 		return wrapInvalidConfig("max record size must be greater than zero")
-	case cfg.MaxRecordSize+uint64(internalwal.HeaderSize) > cfg.SegmentSizeBytes:
+	case physicalSizeForRecord(cfg.MaxRecordSize, cfg.ChunkSizeBytes) > cfg.SegmentSizeBytes:
 		return wrapInvalidConfig("max record size must not exceed segment size")
 	}
 
@@ -125,18 +136,24 @@ func (l *log) Append(ctx context.Context, data []byte) (Position, error) {
 		return ZeroPosition(), ErrRecordTooLarge
 	}
 
-	frameSize := uint64(internalwal.HeaderSize) + uint64(len(data))
+	frameSize := physicalSizeForRecord(uint64(len(data)), l.cfg.ChunkSizeBytes)
 	if frameSize > l.cfg.SegmentSizeBytes {
 		return ZeroPosition(), ErrRecordTooLarge
 	}
 	if l.segments.Size()+frameSize > l.cfg.SegmentSizeBytes {
+		if err := l.syncer.Flush(); err != nil {
+			return ZeroPosition(), err
+		}
 		if _, err := l.segments.Rollover(); err != nil {
 			return ZeroPosition(), err
 		}
 		l.syncer.SetFile(l.segments.WriterFile())
 	}
 
-	res, err := l.writer.Append(ctx, internalwal.AppendRequest{Data: data})
+	res, err := l.writer.Append(ctx, internalwal.AppendRequest{
+		Data:      data,
+		ChunkSize: l.cfg.ChunkSizeBytes,
+	})
 	if err != nil {
 		return ZeroPosition(), err
 	}
@@ -225,4 +242,12 @@ func snapshotReplaySegments(refs []internalwal.SegmentRef) ([]internalwal.Replay
 		})
 	}
 	return out, nil
+}
+
+func physicalSizeForRecord(payloadSize uint64, chunkSize uint32) uint64 {
+	chunks := uint64(1)
+	if payloadSize > 0 && payloadSize > uint64(chunkSize) {
+		chunks = (payloadSize + uint64(chunkSize) - 1) / uint64(chunkSize)
+	}
+	return payloadSize + chunks*uint64(internalwal.HeaderSize)
 }

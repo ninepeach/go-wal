@@ -106,15 +106,14 @@ func isLogicalBoundary(file *os.File, ref ReplaySegment, want uint64, codec Code
 			return true, nil
 		}
 
-		section := io.NewSectionReader(file, int64(offset), int64(ref.Size-offset))
-		header, _, err := codec.Decode(section)
+		next, _, err := scanLogicalRecord(file, ref.Size, offset, codec)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return false, io.ErrUnexpectedEOF
 			}
 			return false, err
 		}
-		offset += uint64(HeaderSize) + uint64(header.Length)
+		offset = next
 	}
 
 	return false, nil
@@ -137,8 +136,7 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 		}
 
 		start := r.offset
-		section := io.NewSectionReader(r.files[r.current], int64(r.offset), int64(ref.Size-r.offset))
-		header, payload, err := r.codec.Decode(section)
+		next, payload, err := scanLogicalRecord(r.files[r.current], ref.Size, r.offset, r.codec)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return ReplayRecord{}, io.ErrUnexpectedEOF
@@ -146,7 +144,7 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 			return ReplayRecord{}, err
 		}
 
-		r.offset += uint64(HeaderSize) + uint64(header.Length)
+		r.offset = next
 		return ReplayRecord{
 			Segment: ref.ID,
 			Offset:  start,
@@ -169,5 +167,44 @@ func closeFiles(files []*os.File) {
 		if file != nil {
 			_ = file.Close()
 		}
+	}
+}
+
+func scanLogicalRecord(file *os.File, size, offset uint64, codec Codec) (uint64, []byte, error) {
+	section := io.NewSectionReader(file, int64(offset), int64(size-offset))
+	header, payload, err := codec.Decode(section)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	next := offset + uint64(HeaderSize) + uint64(header.Length)
+	switch header.Type {
+	case FrameTypeFull:
+		return next, payload, nil
+	case FrameTypeFirst:
+		data := make([]byte, 0, len(payload))
+		data = append(data, payload...)
+		for next < size {
+			section = io.NewSectionReader(file, int64(next), int64(size-next))
+			partHeader, partPayload, err := codec.Decode(section)
+			if err != nil {
+				return 0, nil, err
+			}
+
+			data = append(data, partPayload...)
+			next += uint64(HeaderSize) + uint64(partHeader.Length)
+
+			switch partHeader.Type {
+			case FrameTypeMiddle:
+				continue
+			case FrameTypeLast:
+				return next, data, nil
+			default:
+				return 0, nil, errors.New("wal: invalid chunk sequence")
+			}
+		}
+		return 0, nil, io.ErrUnexpectedEOF
+	default:
+		return 0, nil, errors.New("wal: invalid chunk sequence")
 	}
 }

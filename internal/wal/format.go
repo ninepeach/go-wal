@@ -10,6 +10,16 @@ const (
 	FrameTypeLast
 )
 
+// Valid reports whether the frame type is supported by the current format.
+func (t FrameType) Valid() bool {
+	switch t {
+	case FrameTypeFull, FrameTypeFirst, FrameTypeMiddle, FrameTypeLast:
+		return true
+	default:
+		return false
+	}
+}
+
 const (
 	// SegmentFileExt is the default file extension for WAL segments.
 	SegmentFileExt = ".wal"
