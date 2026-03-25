@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"io"
 )
 
 // ErrCorruption indicates unrecoverable non-tail WAL corruption.
@@ -114,10 +115,17 @@ func scanSegment(path string, size uint64) (uint64, error) {
 	for offset < size {
 		header, err := readFrameHeader(file, offset, size)
 		if err != nil {
-			if inChunks {
-				return recordStart, err
+			switch {
+			case errors.Is(err, io.ErrUnexpectedEOF):
+				if inChunks {
+					return recordStart, errTailCorruption
+				}
+				return offset, errTailCorruption
+			case errors.Is(err, ErrCorruption):
+				return offset, ErrCorruption
+			default:
+				return 0, err
 			}
-			return offset, err
 		}
 
 		frameEnd := offset + uint64(HeaderSize) + uint64(header.Length)
@@ -127,7 +135,7 @@ func scanSegment(path string, size uint64) (uint64, error) {
 			}
 			return offset, errTailCorruption
 		}
-
+		
 		payload := make([]byte, header.Length)
 		if _, err := file.ReadAt(payload, int64(offset+uint64(HeaderSize))); err != nil {
 			if inChunks {
@@ -135,12 +143,13 @@ func scanSegment(path string, size uint64) (uint64, error) {
 			}
 			return offset, errTailCorruption
 		}
+		
 		if checksumFrame(header.Type, payload) != header.Checksum {
-			if frameEnd < size && !inChunks {
+			if frameEnd < size {
+				if inChunks {
+					return recordStart, ErrCorruption
+				}
 				return offset, ErrCorruption
-			}
-			if frameEnd < size && inChunks {
-				return recordStart, ErrCorruption
 			}
 			if inChunks {
 				return recordStart, errTailCorruption
@@ -199,12 +208,12 @@ func truncateSegment(path string, size uint64) error {
 
 func readFrameHeader(file *os.File, offset uint64, size uint64) (FrameHeader, error) {
 	if size-offset < uint64(HeaderSize) {
-		return FrameHeader{}, errTailCorruption
+		return FrameHeader{}, io.ErrUnexpectedEOF
 	}
 
 	var buf [HeaderSize]byte
 	if _, err := file.ReadAt(buf[:], int64(offset)); err != nil {
-		return FrameHeader{}, errTailCorruption
+		return FrameHeader{}, io.ErrUnexpectedEOF
 	}
 
 	header := FrameHeader{
@@ -217,11 +226,11 @@ func readFrameHeader(file *os.File, offset uint64, size uint64) (FrameHeader, er
 
 	switch {
 	case header.Magic != Magic:
-		return FrameHeader{}, errTailCorruption
+		return FrameHeader{}, ErrCorruption
 	case header.Version != FormatVersion:
-		return FrameHeader{}, errTailCorruption
+		return FrameHeader{}, ErrCorruption
 	case !header.Type.Valid():
-		return FrameHeader{}, errTailCorruption
+		return FrameHeader{}, ErrCorruption
 	default:
 		return header, nil
 	}

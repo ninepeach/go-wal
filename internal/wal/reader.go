@@ -141,6 +141,9 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return ReplayRecord{}, io.ErrUnexpectedEOF
 			}
+			if errors.Is(err, ErrCorruption) {
+				return ReplayRecord{}, ErrCorruption
+			}
 			return ReplayRecord{}, err
 		}
 
@@ -200,11 +203,11 @@ func scanLogicalRecord(file *os.File, size, offset uint64, codec Codec) (uint64,
 			case FrameTypeLast:
 				return next, data, nil
 			default:
-				return 0, nil, errors.New("wal: invalid chunk sequence")
+				return 0, nil, ErrCorruption
 			}
 		}
 		return 0, nil, io.ErrUnexpectedEOF
 	default:
-		return 0, nil, errors.New("wal: invalid chunk sequence")
+		return 0, nil, ErrCorruption
 	}
 }

@@ -22,6 +22,8 @@ type Codec interface {
 	Decode(r io.Reader) (FrameHeader, []byte, error)
 }
 
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
 // BinaryCodec encodes the v1 full-frame WAL format.
 type BinaryCodec struct{}
 
@@ -94,7 +96,6 @@ func (BinaryCodec) Decode(r io.Reader) (FrameHeader, []byte, error) {
 }
 
 func checksumFrame(frameType FrameType, payload []byte) uint32 {
-	table := crc32.MakeTable(crc32.Castagnoli)
-	sum := crc32.Update(0, table, []byte{byte(frameType)})
-	return crc32.Update(sum, table, payload)
+	sum := crc32.Update(0, crcTable, []byte{byte(frameType)})
+	return crc32.Update(sum, crcTable, payload)
 }

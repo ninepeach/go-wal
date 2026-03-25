@@ -9,9 +9,6 @@ import (
 	internalwal "github.com/ninepeach/go-wal/internal/wal"
 )
 
-// Reader replays logical records from a starting WAL position.
-//
-// A Reader is safe for concurrent calls to Next and Close.
 type Reader interface {
 	Next(ctx context.Context) (Record, error)
 	Close() error
