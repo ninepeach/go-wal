@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -57,7 +58,7 @@ func NewFileReader(refs []ReplaySegment, from ReplayRequest, codec Codec) (*File
 		files = append(files, file)
 	}
 
-	index, ok, err := locateReplayStart(files, refs, from, codec)
+	index, ok, err := locateReplayStart(files, refs, from)
 	if err != nil {
 		closeFiles(files)
 		return nil, err
@@ -68,7 +69,6 @@ func NewFileReader(refs []ReplaySegment, from ReplayRequest, codec Codec) (*File
 	}
 
 	return &FileReader{
-		codec:   codec,
 		current: index,
 		offset:  from.Offset,
 		files:   files,
@@ -76,7 +76,7 @@ func NewFileReader(refs []ReplaySegment, from ReplayRequest, codec Codec) (*File
 	}, nil
 }
 
-func locateReplayStart(files []*os.File, refs []ReplaySegment, from ReplayRequest, codec Codec) (int, bool, error) {
+func locateReplayStart(files []*os.File, refs []ReplaySegment, from ReplayRequest) (int, bool, error) {
 	if from.Segment == 0 && from.Offset == 0 {
 		return 0, true, nil
 	}
@@ -85,7 +85,7 @@ func locateReplayStart(files []*os.File, refs []ReplaySegment, from ReplayReques
 		if ref.ID != from.Segment {
 			continue
 		}
-		ok, err := isLogicalBoundary(files[i], ref, from.Offset, codec)
+		ok, err := isLogicalBoundary(files[i], ref, from.Offset)
 		if err != nil {
 			return 0, false, err
 		}
@@ -95,7 +95,7 @@ func locateReplayStart(files []*os.File, refs []ReplaySegment, from ReplayReques
 	return 0, false, nil
 }
 
-func isLogicalBoundary(file *os.File, ref ReplaySegment, want uint64, codec Codec) (bool, error) {
+func isLogicalBoundary(file *os.File, ref ReplaySegment, want uint64) (bool, error) {
 	if want >= ref.Size {
 		return false, nil
 	}
@@ -106,7 +106,7 @@ func isLogicalBoundary(file *os.File, ref ReplaySegment, want uint64, codec Code
 			return true, nil
 		}
 
-		next, _, err := scanLogicalRecord(file, ref.Size, offset, codec)
+		next, _, err := scanLogicalRecord(file, ref.Size, offset)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return false, io.ErrUnexpectedEOF
@@ -129,6 +129,7 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 
 	for r.current < len(r.refs) {
 		ref := r.refs[r.current]
+
 		if r.offset >= ref.Size {
 			r.current++
 			r.offset = 0
@@ -136,7 +137,7 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 		}
 
 		start := r.offset
-		next, payload, err := scanLogicalRecord(r.files[r.current], ref.Size, r.offset, r.codec)
+		next, payload, err := scanLogicalRecord(r.files[r.current], ref.Size, r.offset)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return ReplayRecord{}, io.ErrUnexpectedEOF
@@ -151,7 +152,7 @@ func (r *FileReader) Next(ctx context.Context) (ReplayRecord, error) {
 		return ReplayRecord{
 			Segment: ref.ID,
 			Offset:  start,
-			Data:    append([]byte(nil), payload...),
+			Data:    payload,
 		}, nil
 	}
 
@@ -173,29 +174,28 @@ func closeFiles(files []*os.File) {
 	}
 }
 
-func scanLogicalRecord(file *os.File, size, offset uint64, codec Codec) (uint64, []byte, error) {
-	section := io.NewSectionReader(file, int64(offset), int64(size-offset))
-	header, payload, err := codec.Decode(section)
+func scanLogicalRecord(file *os.File, size, offset uint64) (uint64, []byte, error) {
+	header, payload, next, err := readFrameAt(file, size, offset)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	next := offset + uint64(HeaderSize) + uint64(header.Length)
 	switch header.Type {
 	case FrameTypeFull:
 		return next, payload, nil
+
 	case FrameTypeFirst:
-		data := make([]byte, 0, len(payload))
+		data := make([]byte, 0, len(payload)*2)
 		data = append(data, payload...)
+
 		for next < size {
-			section = io.NewSectionReader(file, int64(next), int64(size-next))
-			partHeader, partPayload, err := codec.Decode(section)
+			partHeader, partPayload, partNext, err := readFrameAt(file, size, next)
 			if err != nil {
 				return 0, nil, err
 			}
 
 			data = append(data, partPayload...)
-			next += uint64(HeaderSize) + uint64(partHeader.Length)
+			next = partNext
 
 			switch partHeader.Type {
 			case FrameTypeMiddle:
@@ -206,8 +206,61 @@ func scanLogicalRecord(file *os.File, size, offset uint64, codec Codec) (uint64,
 				return 0, nil, ErrCorruption
 			}
 		}
+
 		return 0, nil, io.ErrUnexpectedEOF
+
 	default:
 		return 0, nil, ErrCorruption
 	}
+}
+
+func readFrameAt(file *os.File, size, offset uint64) (FrameHeader, []byte, uint64, error) {
+	if size-offset < uint64(HeaderSize) {
+		return FrameHeader{}, nil, 0, io.ErrUnexpectedEOF
+	}
+
+	var buf [HeaderSize]byte
+	if _, err := file.ReadAt(buf[:], int64(offset)); err != nil {
+		if errors.Is(err, io.EOF) {
+			return FrameHeader{}, nil, 0, io.ErrUnexpectedEOF
+		}
+		return FrameHeader{}, nil, 0, err
+	}
+
+	header := FrameHeader{
+		Magic:    binary.LittleEndian.Uint32(buf[0:4]),
+		Version:  binary.LittleEndian.Uint16(buf[4:6]),
+		Type:     FrameType(buf[6]),
+		Length:   binary.LittleEndian.Uint32(buf[8:12]),
+		Checksum: binary.LittleEndian.Uint32(buf[12:16]),
+	}
+
+	if header.Magic != Magic {
+		return FrameHeader{}, nil, 0, ErrInvalidFrameMagic
+	}
+	if header.Version != FormatVersion {
+		return FrameHeader{}, nil, 0, ErrInvalidFrameVersion
+	}
+	if !header.Type.Valid() {
+		return FrameHeader{}, nil, 0, ErrUnsupportedFrameType
+	}
+
+	next := offset + uint64(HeaderSize) + uint64(header.Length)
+	if next > size {
+		return FrameHeader{}, nil, 0, io.ErrUnexpectedEOF
+	}
+
+	payload := make([]byte, header.Length)
+	if _, err := file.ReadAt(payload, int64(offset+uint64(HeaderSize))); err != nil {
+		if errors.Is(err, io.EOF) {
+			return FrameHeader{}, nil, 0, io.ErrUnexpectedEOF
+		}
+		return FrameHeader{}, nil, 0, err
+	}
+
+	if checksumFrame(header.Type, payload) != header.Checksum {
+		return FrameHeader{}, nil, 0, ErrInvalidFrameChecksum
+	}
+
+	return header, payload, next, nil
 }

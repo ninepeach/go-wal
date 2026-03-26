@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"bytes"
 	"context"
 )
 
@@ -28,9 +27,10 @@ type FileWriter struct {
 	segments *FileSegmentManager
 	codec    Codec
 	syncer   Syncer
+	scratch  []byte
 }
 
-// Append writes one logical record as one or more physical frames into the active segment.
+// NewFileWriter creates a phase 1 writer.
 func NewFileWriter(segments *FileSegmentManager, codec Codec, syncer Syncer) *FileWriter {
 	return &FileWriter{
 		segments: segments,
@@ -48,18 +48,16 @@ func (w *FileWriter) Append(ctx context.Context, req AppendRequest) (AppendResul
 	}
 
 	offset := w.segments.Size()
-	frames, err := buildFrames(w.codec, req.Data, req.ChunkSize)
+
+	encoded, totalBytes, err := w.encodeRecordIntoScratch(req.Data, req.ChunkSize)
 	if err != nil {
 		return AppendResult{}, err
 	}
 
-	var totalBytes uint64
-	for _, frame := range frames {
-		if _, err := w.segments.WriterFile().Write(frame); err != nil {
-			return AppendResult{}, err
-		}
-		totalBytes += uint64(len(frame))
+	if _, err := w.segments.WriterFile().Write(encoded); err != nil {
+		return AppendResult{}, err
 	}
+
 	w.segments.Advance(totalBytes)
 
 	if err := w.syncer.Request(ctx, SyncRequest{Bytes: totalBytes}); err != nil {
@@ -78,6 +76,44 @@ func (w *FileWriter) Close() error {
 		return nil
 	}
 	return w.syncer.Close()
+}
+
+func (w *FileWriter) encodeRecordIntoScratch(data []byte, chunkSize uint32) ([]byte, uint64, error) {
+	w.scratch = w.scratch[:0]
+	sw := sliceWriter{buf: w.scratch}
+
+	if len(data) == 0 || uint32(len(data)) <= chunkSize {
+		if err := w.codec.Encode(&sw, FrameHeader{Type: FrameTypeFull}, data); err != nil {
+			return nil, 0, err
+		}
+		w.scratch = sw.buf
+		return w.scratch, uint64(HeaderSize + len(data)), nil
+	}
+
+	var totalBytes uint64
+	for start := 0; start < len(data); start += int(chunkSize) {
+		end := start + int(chunkSize)
+		if end > len(data) {
+			end = len(data)
+		}
+
+		frameType := FrameTypeMiddle
+		switch {
+		case start == 0:
+			frameType = FrameTypeFirst
+		case end == len(data):
+			frameType = FrameTypeLast
+		}
+
+		payload := data[start:end]
+		if err := w.codec.Encode(&sw, FrameHeader{Type: frameType}, payload); err != nil {
+			return nil, 0, err
+		}
+		totalBytes += uint64(HeaderSize + len(payload))
+	}
+
+	w.scratch = sw.buf
+	return w.scratch, totalBytes, nil
 }
 
 func buildFrames(codec Codec, data []byte, chunkSize uint32) ([][]byte, error) {
@@ -115,11 +151,11 @@ func buildFrames(codec Codec, data []byte, chunkSize uint32) ([][]byte, error) {
 }
 
 func encodeFrame(codec Codec, frameType FrameType, payload []byte) ([]byte, error) {
-	var buf bytes.Buffer
+	var buf sliceWriter
 	if err := codec.Encode(&buf, FrameHeader{Type: frameType}, payload); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return buf.buf, nil
 }
 
 func chunkCount(length int, chunkSize uint32) int {
@@ -137,4 +173,13 @@ func chunkCount(length int, chunkSize uint32) int {
 // It is intended for package tests that need crash-style file mutation.
 func BuildTestFrames(data []byte, chunkSize uint32) ([][]byte, error) {
 	return buildFrames(BinaryCodec{}, data, chunkSize)
+}
+
+type sliceWriter struct {
+	buf []byte
+}
+
+func (w *sliceWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
 }
